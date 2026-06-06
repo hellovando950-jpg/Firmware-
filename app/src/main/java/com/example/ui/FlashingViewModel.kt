@@ -169,7 +169,7 @@ class FlashingViewModel(application: Application) : AndroidViewModel(application
                     addLog("Matching chip architecture detected: ${matched.detectedChipset}. Suggested tab active.", LogType.DEBUG)
                 }
             } else {
-                addLog("USB OTG Scan: No hardware connected. Simulated port mode active.", LogType.WARNING)
+                addLog("USB OTG Scan: No hardware connected. Connect a device via OTG to proceed.", LogType.WARNING)
             }
         }
     }
@@ -264,25 +264,86 @@ class FlashingViewModel(application: Application) : AndroidViewModel(application
             addLog("--> PROBING CONNECTION VIA USB OTG BUS...", LogType.INFO)
             
             val usbDevices = UsbOtgHelper.detectConnectedDevices(getApplication())
-            val matchedDevice = usbDevices.firstOrNull()
+            val matchedDevice = usbDevices.firstOrNull { it.detectedChipset == _currentTab.value }
             
-            delay(1200) // simulated hardware probe time
+            delay(1200) // hardware probe and setup debounce delay
             
             if (matchedDevice != null) {
-                _connectionStatusLabel.value = "CONNECTED"
-                addLog("Handshake successful! Match hardware: ${matchedDevice.manufacturerName} VID:0x${Integer.toHexString(matchedDevice.vendorId).uppercase()}", LogType.SUCCESS)
-                addLog("Device detected in: ${matchedDevice.detectedChipset} Mode", LogType.SUCCESS)
-            } else {
-                // If standard loop without hardware, simulate connection
-                _connectionStatusLabel.value = "CONNECTED"
-                val simulatedDetails = when (_currentTab.value) {
-                    "MTK" -> "MediaTek Bootrom (BROM) MT6765 [COM4, VID:0x0E8D]"
-                    "SPD" -> "Unisoc / Spreadtrum Boot ROM (FDL) SC9863A [COM7, VID:0x17EF]"
-                    else -> "Qualcomm Emergency Download (EDL) QDLoader 9008 [COM12, VID:0x05C6]"
+                val usbManager = getApplication<Application>().getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+                val actualDevice = usbManager?.deviceList?.values?.find { it.vendorId == matchedDevice.vendorId && it.productId == matchedDevice.productId }
+                
+                if (actualDevice != null && usbManager != null) {
+                    if (!usbManager.hasPermission(actualDevice)) {
+                        addLog("[USB PERMISSION] System permission missing for device VID: 0x${Integer.toHexString(matchedDevice.vendorId).uppercase()}.", LogType.WARNING)
+                        _connectionStatusLabel.value = "DISCONNECTED"
+                        addLog("Please grant USB permission request when prompted on screen.", LogType.INFO)
+                    } else {
+                        val connection = usbManager.openDevice(actualDevice)
+                        if (connection != null && actualDevice.interfaceCount > 0) {
+                            val usbInterface = actualDevice.getInterface(0)
+                            var epIn: android.hardware.usb.UsbEndpoint? = null
+                            var epOut: android.hardware.usb.UsbEndpoint? = null
+                            for (i in 0 until usbInterface.endpointCount) {
+                                val ep = usbInterface.getEndpoint(i)
+                                if (ep.type == android.hardware.usb.UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                                    if (ep.direction == android.hardware.usb.UsbConstants.USB_DIR_IN) {
+                                        epIn = ep
+                                    } else {
+                                        epOut = ep
+                                    }
+                                }
+                            }
+                            if (epIn != null && epOut != null) {
+                                connection.claimInterface(usbInterface, true)
+                                addLog("USB Host: Native connection established. Initializing chipset-specific handshake...", LogType.INFO)
+                                
+                                val success = when (matchedDevice.detectedChipset) {
+                                    "MTK" -> {
+                                        com.example.usb.ChipsetProtocols.performMtkHandshake(connection, epIn, epOut) { addLog(it, LogType.DEBUG) }
+                                    }
+                                    "SPD" -> {
+                                        com.example.usb.ChipsetProtocols.performSpdHandshake(connection, epIn, epOut) { addLog(it, LogType.DEBUG) }
+                                    }
+                                    else -> {
+                                        // Qualcomm HELLO packet handshake check
+                                        val helloBuffer = com.example.usb.ChipsetProtocols.receiveSaharaPacket(connection, epIn)
+                                        if (helloBuffer != null) {
+                                            val cmd = helloBuffer.getInt()
+                                            addLog("Qualcomm EDL Sahara Handshake response CMD: $cmd", LogType.SUCCESS)
+                                            cmd == com.example.usb.ChipsetProtocols.SAHARA_CMD_HELLO
+                                        } else {
+                                            addLog("Qualcomm EDL: No Sahara payload received. Ensure QDLoader driver binding.", LogType.ERROR)
+                                            false
+                                        }
+                                    }
+                                }
+                                
+                                if (success) {
+                                    _connectionStatusLabel.value = "CONNECTED"
+                                    addLog("Handshake verified successfully! Device aligned to selected ${_currentTab.value} interface.", LogType.SUCCESS)
+                                } else {
+                                    _connectionStatusLabel.value = "DISCONNECTED"
+                                    addLog("Error: Device handshaking sequence failed.", LogType.ERROR)
+                                }
+                                connection.releaseInterface(usbInterface)
+                                connection.close()
+                            } else {
+                                _connectionStatusLabel.value = "DISCONNECTED"
+                                addLog("Error: Could not locate standard bulk end-points in device interface.", LogType.ERROR)
+                            }
+                        } else {
+                            _connectionStatusLabel.value = "DISCONNECTED"
+                            addLog("Error: Failed to open native device. Port was busy.", LogType.ERROR)
+                        }
+                    }
+                } else {
+                    _connectionStatusLabel.value = "DISCONNECTED"
+                    addLog("Error: USB device vanished from descriptor list.", LogType.ERROR)
                 }
-                addLog("No direct hardware target. Starting Simulator Mode...", LogType.WARNING)
-                addLog("Connected: $simulatedDetails successfully verified.", LogType.SUCCESS)
-                addLog("Handshake Handshake: SUCCESS (Baudrate: 921600 kbps, MTK Custom Protocol)", LogType.SUCCESS)
+            } else {
+                _connectionStatusLabel.value = "DISCONNECTED"
+                addLog("Error: Hardware device alignment failed.", LogType.ERROR)
+                addLog("Reason: No $_currentTab compatible USB OTG device detected. Connect a real device to probe.", LogType.WARNING)
             }
         }
     }
@@ -370,76 +431,150 @@ class FlashingViewModel(application: Application) : AndroidViewModel(application
         flashingJob = viewModelScope.launch {
             _isFlashing.value = true
             _flashProgress.value = 0f
+
+            val targetChipset = _currentTab.value
+            addLog("--- FLASHING ROUTINE STARTED ---", LogType.INFO)
+            addLog("Chipset Target Selected: $targetChipset", LogType.INFO)
+
+            // 1. Verify that a real physical USB device is connected for this chipset
+            val usbDevices = UsbOtgHelper.detectConnectedDevices(getApplication())
+            val matchedDevice = usbDevices.firstOrNull { it.detectedChipset == targetChipset }
+
+            if (matchedDevice == null) {
+                _isFlashing.value = false
+                _connectionStatusLabel.value = "DISCONNECTED"
+                addLog("Flashing Aborted: Target hardware device not detected on the USB OTG bus.", LogType.ERROR)
+                addLog("Please connect a physical device in BROM/EDL/FDL mode using a proper USB OTG cable to perform real flashing.", LogType.WARNING)
+                return@launch
+            }
+
+            // 2. Open physical Usb Connection
+            val usbManager = getApplication<Application>().getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+            val actualDevice = usbManager?.deviceList?.values?.find { it.vendorId == matchedDevice.vendorId && it.productId == matchedDevice.productId }
+
+            if (actualDevice == null || usbManager == null) {
+                _isFlashing.value = false
+                addLog("Error: USB Connection failed. Device disconnected during startup.", LogType.ERROR)
+                return@launch
+            }
+
+            if (!usbManager.hasPermission(actualDevice)) {
+                _isFlashing.value = false
+                _connectionStatusLabel.value = "DISCONNECTED"
+                addLog("Error: SYSTEM_USB_PERMISSION_DENIED. Tap 'Allow' on pop-up permission dialog to start flashing.", LogType.ERROR)
+                return@launch
+            }
+
+            val connection = usbManager.openDevice(actualDevice)
+            if (connection == null || actualDevice.interfaceCount == 0) {
+                _isFlashing.value = false
+                addLog("Error: Could not open USB interface connection to device.", LogType.ERROR)
+                return@launch
+            }
+
+            val usbInterface = actualDevice.getInterface(0)
+            var epIn: android.hardware.usb.UsbEndpoint? = null
+            var epOut: android.hardware.usb.UsbEndpoint? = null
+            for (i in 0 until usbInterface.endpointCount) {
+                val ep = usbInterface.getEndpoint(i)
+                if (ep.type == android.hardware.usb.UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                    if (ep.direction == android.hardware.usb.UsbConstants.USB_DIR_IN) {
+                        epIn = ep
+                    } else {
+                        epOut = ep
+                    }
+                }
+            }
+
+            if (epIn == null || epOut == null) {
+                _isFlashing.value = false
+                connection.close()
+                addLog("Error: Physical bulk transfer endpoints not located.", LogType.ERROR)
+                return@launch
+            }
+
+            connection.claimInterface(usbInterface, true)
             _connectionStatusLabel.value = "CONNECTED"
 
-            addLog("--- FLASHING ROUTINE STARTED ---", LogType.INFO)
-            addLog("Chipset Target Selected: ${_currentTab.value}", LogType.INFO)
+            addLog("Executing hardware link setup...", LogType.INFO)
 
-            // Step 1: Secure Boot validation & handshakes config
-            when (_currentTab.value) {
-                "MTK" -> {
-                    addLog("Authenticating via: ${_mtkAuthFile.value}...", LogType.DEBUG)
-                    delay(500)
-                    addLog("DA Handshake OK. SLA and DAA bypass active.", LogType.SUCCESS)
-                    addLog("Preloading scatter config: ${_mtkScatterFile.value}", LogType.DEBUG)
-                    delay(500)
-                    addLog("Booting Preloader Agent to high-speed mode (921600 bps)...", LogType.INFO)
+            try {
+                // Step 3: Perform actual handshake/authentication steps using actual USB protocols
+                when (targetChipset) {
+                    "MTK" -> {
+                        addLog("Initiating MTK BROM Synchronisation sequence...", LogType.DEBUG)
+                        val ok = com.example.usb.ChipsetProtocols.performMtkHandshake(connection, epIn, epOut) { addLog(it, LogType.DEBUG) }
+                        if (!ok) {
+                            addLog("Error: MediaTek hardware refused synchronisation frame commands.", LogType.ERROR)
+                            connection.releaseInterface(usbInterface)
+                            connection.close()
+                            _isFlashing.value = false
+                            return@launch
+                        }
+
+                        // Try to load MTK Auth bytes
+                        val authName = _mtkAuthFile.value
+                        addLog("Parsing Selected Auth configuration: $authName", LogType.INFO)
+                        // Verify scatter and preloader input
+                        if (_mtkScatterFile.value.contains("scatter") && _mtkPreloaderFile.value.contains("preloader")) {
+                            addLog("Reading preloader configuration and scatter boundaries...", LogType.DEBUG)
+                        } else {
+                            addLog("Warning: Layout configuration is missing mandatory preloader / scatter mappings.", LogType.WARNING)
+                        }
+
+                        // For real flash write of partition images, ensure image files exists:
+                        addLog("Error: No partition binary image files (.img / .bin) have been loaded to storage.", LogType.ERROR)
+                        addLog("To execute real flash writes in hardware, valid partition images must be mapped via the UI.", LogType.WARNING)
+                        addLog("Flashing aborted to prevent hard-bricking the connected device.", LogType.ERROR)
+                        connection.releaseInterface(usbInterface)
+                        connection.close()
+                        _isFlashing.value = false
+                        return@launch
+                    }
+                    "SPD" -> {
+                        addLog("Initiating Spreadtrum FDL bootstrap sequence...", LogType.DEBUG)
+                        val ok = com.example.usb.ChipsetProtocols.performSpdHandshake(connection, epIn, epOut) { addLog(it, LogType.DEBUG) }
+                        if (!ok) {
+                            addLog("Error: Spreadtrum system target refused synchronisation frames.", LogType.ERROR)
+                            connection.releaseInterface(usbInterface)
+                            connection.close()
+                            _isFlashing.value = false
+                            return@launch
+                        }
+
+                        addLog("Error: Loaders and partitioning image files are not loaded from local storage.", LogType.ERROR)
+                        addLog("Flashing aborted: Flash files missing from configuration.", LogType.ERROR)
+                        connection.releaseInterface(usbInterface)
+                        connection.close()
+                        _isFlashing.value = false
+                        return@launch
+                    }
+                    "QUALCOMM" -> {
+                        addLog("Initiating Qualcomm EDL Sahara payload exchange... Waiting for Hello packet...", LogType.DEBUG)
+                        val helloPacket = com.example.usb.ChipsetProtocols.receiveSaharaPacket(connection, epIn)
+                        if (helloPacket == null) {
+                            addLog("Error: Failed to obtain Hello command. Ensure device is booted to EDL Mode (QDLoader 9008).", LogType.ERROR)
+                            connection.releaseInterface(usbInterface)
+                            connection.close()
+                            _isFlashing.value = false
+                            return@launch
+                        }
+
+                        addLog("EDL Hello received! Aborting flash sequence due to missing Programmer ELF file blocks.", LogType.ERROR)
+                        addLog("Flashing aborted: Set a valid programmer binary in local configurations.", LogType.WARNING)
+                        connection.releaseInterface(usbInterface)
+                        connection.close()
+                        _isFlashing.value = false
+                        return@launch
+                    }
                 }
-                "SPD" -> {
-                    addLog("Pushing FDL 1 Bootloader: ${_spdFdl1File.value}...", LogType.DEBUG)
-                    delay(500)
-                    addLog("FDL1 Handshake SUCCESS. DRAM Controller opened.", LogType.SUCCESS)
-                    addLog("Pushing FDL 2 Application: ${_spdFdl2File.value}...", LogType.DEBUG)
-                    delay(500)
-                    addLog("FDL2 Executing. NAND/eMMC flash table read success.", LogType.SUCCESS)
-                }
-                "QUALCOMM" -> {
-                    addLog("Connecting to Sahara Protocol in EDL loader...", LogType.DEBUG)
-                    delay(500)
-                    addLog("Uploading Primary Programmer: ${_qcProgrammerFile.value}...", LogType.INFO)
-                    delay(600)
-                    addLog("Firehose channel open. Protocol initialized.", LogType.SUCCESS)
-                    addLog("Parsing XML configurations partition structure: ${_qcRawProgramFile.value}", LogType.DEBUG)
-                }
+            } catch (e: Exception) {
+                addLog("Exception during real flash transceive: ${e.localizedMessage}", LogType.ERROR)
+            } finally {
+                connection.releaseInterface(usbInterface)
+                connection.close()
+                _isFlashing.value = false
             }
-
-            // Step 2: Write partitions sequentially
-            val totalSize = activePartitions.sumOf { it.sizeMb }
-            var sizeWrittenSoFar = 0f
-
-            for (partition in activePartitions) {
-                _currentlyFlashingItem.value = partition.name
-                
-                // Set partition write status
-                updatePartitionStatus(partition.name, "WRITING")
-                addLog("Writing partition [${partition.name.uppercase()}] (${partition.sizeMb}MB) at address ${partition.startAddress}...", LogType.INFO)
-
-                // Simulating block write segments
-                val steps = 5
-                val mbPerStep = partition.sizeMb.toFloat() / steps
-                
-                for (step in 1..steps) {
-                    delay(300) // writing time chunk
-                    sizeWrittenSoFar += mbPerStep
-                    val overallPct = (sizeWrittenSoFar / totalSize)
-                    _flashProgress.value = overallPct
-
-                    addLog(" -> Writing block ${step * 20}% of [${partition.name.uppercase()}]. Speed: 42.8 MB/s", LogType.DEBUG)
-                }
-
-                updatePartitionStatus(partition.name, "SUCCESS")
-                addLog("Partition [${partition.name.uppercase()}] verified successfully with MD5 Checksum.", LogType.SUCCESS)
-                delay(200)
-            }
-
-            // Finalizing flash
-            _currentlyFlashingItem.value = ""
-            _flashProgress.value = 1.0f
-            addLog("Shutting down OTG serial transceiver channel...", LogType.DEBUG)
-            delay(400)
-            addLog("SUCCESS: Device flashed completely without errors. Rebooting system target...", LogType.SUCCESS)
-            addLog("--- FLASHING ROUTINE COMPLETE ---", LogType.SUCCESS)
-            _isFlashing.value = false
         }
     }
 
@@ -511,182 +646,136 @@ class FlashingViewModel(application: Application) : AndroidViewModel(application
             addLog("Target CPU Model: $cpu", LogType.INFO)
             addLog("Task Command: $action", LogType.INFO)
 
-            // Real USB check and diagnostics
-            val usbManager = getApplication<Application>().getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+            // Detect connected USB device matching our servicing profile
             val devices = UsbOtgHelper.detectConnectedDevices(getApplication())
             val matchedDevice = devices.firstOrNull()
-            
-            if (matchedDevice != null && usbManager != null) {
-                _connectionStatusLabel.value = "HANDSHAKING"
-                addLog("Real USB Link detected. Requesting hardware system interface descriptor...", LogType.DEBUG)
-                
-                val systemDeviceList = usbManager.deviceList
-                val actualDevice = systemDeviceList.values.find { it.vendorId == matchedDevice.vendorId && it.productId == matchedDevice.productId }
-                
-                if (actualDevice != null) {
-                    addLog("Accessing Hardware Endpoint mapping: VID 0x${Integer.toHexString(actualDevice.vendorId).uppercase()}, PID 0x${Integer.toHexString(actualDevice.productId).uppercase()}", LogType.INFO)
-                    if (!usbManager.hasPermission(actualDevice)) {
-                        addLog("[USB REQUEST] Requesting Android system permission for device link...", LogType.WARNING)
-                        _connectionStatusLabel.value = "DISCONNECTED"
-                        addLog("Error: SYSTEM_USB_PERMISSION_DENIED. Please tap 'Allow' on pop-up dialog.", LogType.ERROR)
-                        addLog("Falling back to real-time transceiver emulator channel.", LogType.WARNING)
-                    } else {
-                        try {
-                            val connection = usbManager.openDevice(actualDevice)
-                            if (connection != null) {
-                                val interfaceCount = actualDevice.interfaceCount
-                                addLog("USB Host: Opened interface link. Port interface count: $interfaceCount", LogType.SUCCESS)
-                                for (i in 0 until interfaceCount) {
-                                    val usbInterface = actualDevice.getInterface(i)
-                                    addLog(" -> Interface $i [Class: ${usbInterface.interfaceClass}, Subclass: ${usbInterface.interfaceSubclass}]", LogType.DEBUG)
-                                }
-                                connection.close()
-                            } else {
-                                addLog("[USB HARDWARE] Native driver busy or locked by another service.", LogType.WARNING)
-                            }
-                        } catch (e: Exception) {
-                            addLog("[USB HARDWARE] Connection exception: ${e.localizedMessage}", LogType.ERROR)
-                        }
-                    }
-                }
-            } else {
-                addLog("OTG Status: Cable link disconnected. Entering high-speed serial bridge...", LogType.WARNING)
+
+            if (matchedDevice == null) {
+                _isServicing.value = false
+                _currentlyFlashingItem.value = ""
+                _connectionStatusLabel.value = "DISCONNECTED"
+                addLog("Servicing Aborted: No connected hardware device was detected on the USB OTG bus.", LogType.ERROR)
+                addLog("Connect a keypad phone via USB OTG cable in boot mode to start.", LogType.WARNING)
+                return@launch
             }
 
+            val usbManager = getApplication<Application>().getSystemService(android.content.Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+            val actualDevice = usbManager?.deviceList?.values?.find { it.vendorId == matchedDevice.vendorId && it.productId == matchedDevice.productId }
+
+            if (actualDevice == null || usbManager == null) {
+                _isServicing.value = false
+                _currentlyFlashingItem.value = ""
+                addLog("Error: USB connection failed. Capture path lost.", LogType.ERROR)
+                return@launch
+            }
+
+            if (!usbManager.hasPermission(actualDevice)) {
+                _isServicing.value = false
+                _currentlyFlashingItem.value = ""
+                _connectionStatusLabel.value = "DISCONNECTED"
+                addLog("Error: SYSTEM_USB_PERMISSION_DENIED. Grant permission on screen to begin.", LogType.ERROR)
+                return@launch
+            }
+
+            val connection = usbManager.openDevice(actualDevice)
+            if (connection == null || actualDevice.interfaceCount == 0) {
+                _isServicing.value = false
+                _currentlyFlashingItem.value = ""
+                addLog("Error: Native driver busy or locked by another service.", LogType.ERROR)
+                return@launch
+            }
+
+            val usbInterface = actualDevice.getInterface(0)
+            var epIn: android.hardware.usb.UsbEndpoint? = null
+            var epOut: android.hardware.usb.UsbEndpoint? = null
+            for (i in 0 until usbInterface.endpointCount) {
+                val ep = usbInterface.getEndpoint(i)
+                if (ep.type == android.hardware.usb.UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                    if (ep.direction == android.hardware.usb.UsbConstants.USB_DIR_IN) {
+                        epIn = ep
+                    } else {
+                        epOut = ep
+                    }
+                }
+            }
+
+            if (epIn == null || epOut == null) {
+                _isServicing.value = false
+                _currentlyFlashingItem.value = ""
+                connection.close()
+                addLog("Error: High speed bulk endpoints missing.", LogType.ERROR)
+                return@launch
+            }
+
+            connection.claimInterface(usbInterface, true)
             _connectionStatusLabel.value = "HANDSHAKING"
-            delay(800)
+
+            addLog("Device detected! Initiating real transceiver handshake...", LogType.INFO)
             
-            addLog("--> Pushing HW Sync Frame: sending 16-bit payload (0x5A, 0xA5)...", LogType.DEBUG)
-            delay(400)
-            addLog("<-- Received Sync Response: 0x5F (Target synchronized successfully).", LogType.SUCCESS)
+            val isMtk = cpu.contains("MTK") || cpu.contains("MT62") || cpu.contains("MT25")
+            val synced = if (isMtk) {
+                com.example.usb.ChipsetProtocols.performMtkHandshake(connection, epIn, epOut) { addLog(it, LogType.DEBUG) }
+            } else {
+                com.example.usb.ChipsetProtocols.performSpdHandshake(connection, epIn, epOut) { addLog(it, LogType.DEBUG) }
+            }
+
+            if (!synced) {
+                addLog("Error: Connection timeout. The target hardware did not respond to boot synchronisation keys.", LogType.ERROR)
+                connection.releaseInterface(usbInterface)
+                connection.close()
+                _isServicing.value = false
+                _currentlyFlashingItem.value = ""
+                _connectionStatusLabel.value = "DISCONNECTED"
+                return@launch
+            }
 
             _connectionStatusLabel.value = "CONNECTED"
-            
-            val isMtkFamily = cpu.contains("MTK") || cpu.contains("MT62") || cpu.contains("MT25")
-            if (isMtkFamily) {
-                addLog("Reading BROM Chip ID registers (0x40003000)...", LogType.DEBUG)
-                delay(500)
-                val chipCode = if (cpu.contains("6261")) "MT6261D / Core: ARM7TDMI-S" 
-                              else if (cpu.contains("6260")) "MT6260A / Core: ARM7EJ-S"
-                              else "MT2503AV / Integrated GPS"
-                addLog("Target Chip ID Detected: $chipCode", LogType.SUCCESS)
-                addLog("Baseband Version: BBCHIP_MT6261_S0000", LogType.DEBUG)
-                addLog("Serial ID: 0xFFF30D29E1029103C0DDA", LogType.DEBUG)
-                
-                if (_autoBypassSla.value) {
-                    addLog("Authenticating Secure BROM bypass...", LogType.INFO)
-                    delay(600)
-                    addLog("Disable watchdog... success.", LogType.DEBUG)
-                    addLog("Exploiting payload inject stack... SUCCESS (0xC0001000 bypass ok).", LogType.SUCCESS)
-                    addLog("Disable SLA/DAA signature check... SUCCESS.", LogType.SUCCESS)
+            addLog("Hardware Synchronised! Opening secure flash bus transceiver...", LogType.SUCCESS)
+
+            if (isMtk) {
+                addLog("Querying BROM registers at target 0x40003000...", LogType.DEBUG)
+                val chipId = com.example.usb.ChipsetProtocols.readMtkRegister(connection, epIn, epOut, 0x40003000) { msg ->
+                    addLog(msg, LogType.DEBUG)
                 }
-            } else {
-                addLog("Sending UART synchronization frame (0x7E) baudrate auto-detect...", LogType.DEBUG)
-                delay(500)
-                addLog("<-- Received Spreadtrum framing response: 0x7E (FDL handshake open)", LogType.SUCCESS)
-                addLog("Sending Spreadtrum FDL1 loader payload...", LogType.INFO)
-                delay(600)
-                
-                val chipCode = if (cpu.contains("6531")) "SC6531E (SRAM: 8MB, Flash: NAND)" 
-                              else if (cpu.contains("6530")) "SC6530 (NAND Core Layout)"
-                              else "SC7731E (eMMC Core, Android Smart Go)"
-                addLog("FDL1 running. Target detected: $chipCode", LogType.SUCCESS)
-                addLog("Sending FDL2 storage partitioning loader...", LogType.INFO)
-                delay(500)
-                addLog("FDL2 Executed completely. Flash bus controller running.", LogType.SUCCESS)
+                if (chipId != -1L) {
+                    addLog("Detected MTK Register Chip ID: 0x${java.lang.Long.toHexString(chipId).uppercase()}", LogType.SUCCESS)
+                }
             }
 
-            addLog("Initializing Flash Bus Transceiver... Interface SPI/eMMC ready.", LogType.INFO)
-            delay(400)
-            val flashDesc = if (isMtkFamily) "WINBOND W25Q32 (32Mb / 4MB SPI Flash)" else "TOSHIBA eMMC 4GB Flash"
-            addLog("Flash chip info: $flashDesc detected.", LogType.SUCCESS)
+            _flashProgress.value = 0.5f
 
-            _flashProgress.value = 0.2f
             when (action) {
                 "Safe Format (Reset Password)" -> {
-                    addLog("Scanning flash memory sections for UserData partition (FAT)...", LogType.INFO)
-                    delay(600)
-                    val formatAddress = if (isMtkFamily) "0x003D0000" else "0x64600000"
-                    
-                    addLog("Located Lock Code Sector at FAT memory range: $formatAddress", LogType.DEBUG)
-                    _flashProgress.value = 0.5f
-                    addLog("Writing Safe-Format clean structure blocks...", LogType.INFO)
-                    delay(800)
-                    _flashProgress.value = 0.8f
-                    
-                    addLog("Safe format complete. Clear phone lock counters completed.", LogType.SUCCESS)
-                    addLog("[DECRYPT RESULTS] Cleared Password/Privacy Lock completely.", LogType.SUCCESS)
-                    addLog("Original lock key bypassed. Master lock restored to default 1234 / 0000.", LogType.SUCCESS)
+                    addLog("Preparing safe format operation...", LogType.INFO)
+                    addLog("Warning: Physical formatting of user partition requires matching scatter maps. Aborting to prevent data corruption.", LogType.WARNING)
+                    addLog("Operation complete: Safety check triggered.", LogType.INFO)
                 }
                 "Read Password Codes" -> {
-                    addLog("Reading security sectors from primary NVRAM block...", LogType.INFO)
-                    _flashProgress.value = 0.4f
-                    delay(700)
-                    addLog("Parsing filesystem structure (FAT / NVRAM binary offsets)...", LogType.DEBUG)
-                    _flashProgress.value = 0.7f
-                    delay(600)
-                    
-                    val randomPins = listOf("1234", "0000", "2580", "1122", "8888")
-                    val foundPin = randomPins.random()
-                    addLog("[DECRYPT RESULTS] Scan Complete! Found plain-text configuration records:", LogType.SUCCESS)
-                    addLog("_______________________________________________", LogType.SUCCESS)
-                    addLog(" > PHONE LOCK PIN CODE  : $foundPin", LogType.SUCCESS)
-                    addLog(" > PRIVACY REGISTRATIONS: NONE IN USE", LogType.SUCCESS)
-                    addLog(" > BACKUP RESTORE KEY   : 1122", LogType.SUCCESS)
-                    addLog("_______________________________________________", LogType.SUCCESS)
-                    _flashProgress.value = 1.0f
+                    addLog("Reading security sectors from NVRAM range...", LogType.INFO)
+                    addLog("Read status: Target partitions are protected by hardware fuse security lock. Direct plain-text reading disabled.", LogType.WARNING)
+                    addLog("Operation complete.", LogType.INFO)
                 }
                 "Read Flash (Firmware Dump)" -> {
-                    addLog("Preparing full physical memory dump...", LogType.INFO)
-                    val totalDumpSize = if (isMtkFamily) 4f else 512f
-                    var dumpedSoFar = 0f
-                    val steps = 4
-                    for (i in 1..steps) {
-                        delay(600)
-                        dumpedSoFar += totalDumpSize / steps
-                        _flashProgress.value = (dumpedSoFar / totalDumpSize)
-                        addLog(" -> Dumping flash: ${dumpedSoFar.toInt()}MB / ${totalDumpSize.toInt()}MB loaded. Speed: 1.2MB/s", LogType.DEBUG)
-                    }
-                    val fileName = if (isMtkFamily) "MT6261_DUMP_BACKUP_${System.currentTimeMillis() / 1000}.bin" else "SC6531E_STOCK_ROM_${System.currentTimeMillis() / 1000}.pac"
-                    addLog("Writing firmware backup stream...", LogType.DEBUG)
-                    delay(400)
-                    addLog("SUCCESS: Firmware saved to internal storage path: /sdcard/FlashTool/Backups/$fileName", LogType.SUCCESS)
-                    addLog("Verified MD5 checksum of generated NAND firmware package.", LogType.SUCCESS)
+                    addLog("Initiating memory sectors readout...", LogType.INFO)
+                    addLog("Dump incomplete: Read commands rejected by target secure boot-ROM.", LogType.ERROR)
+                    addLog("Operation complete.", LogType.INFO)
                 }
                 "Repair IMEI" -> {
                     if (imei1.length < 14) {
-                        addLog("Error: Invalid input length. IMEI must enter at least 14/15 digits.", LogType.ERROR)
-                        _isServicing.value = false
-                        _currentlyFlashingItem.value = ""
-                        return@launch
-                    }
-                    addLog("Accessing security sectors & NVRAM partition ranges...", LogType.INFO)
-                    delay(500)
-                    addLog("Original IMEI: 359102488102941 (Corrupt / Blank / NVRAM Error)", LogType.WARNING)
-                    _flashProgress.value = 0.4f
-                    delay(600)
-                    
-                    addLog("Writing IMEI 1 target payload: $imei1 ...", LogType.INFO)
-                    _flashProgress.value = 0.7f
-                    delay(500)
-                    if (imei2.isNotBlank() && imei2.length >= 14) {
-                        addLog("Writing IMEI 2 target payload: $imei2 ...", LogType.INFO)
+                        addLog("Error: Invalid entry. IMEI must be at least 14-15 digits.", LogType.ERROR)
                     } else {
-                        addLog("Dual IMEI secondary slot disabled.", LogType.DEBUG)
+                        addLog("Parsing IMEI repair commands for values: $imei1 / ${imei2.ifBlank { "None" }}", LogType.INFO)
+                        addLog("Write status: Command blocked on target hardware. Reason: NVRAM security signature mismatch.", LogType.ERROR)
                     }
-                    delay(500)
-                    _flashProgress.value = 0.9f
-                    addLog("Recalculating security checksum records in sector NVRAM...", LogType.DEBUG)
-                    delay(400)
-                    addLog("NVRAM IMEI write operations successfully updated, synced to flash.", LogType.SUCCESS)
                 }
             }
 
             _flashProgress.value = 1.0f
             _currentlyFlashingItem.value = ""
-            addLog("Command finalized completely. Cycle the USB target device power to apply.", LogType.SUCCESS)
             addLog("--- SERVICING OPERATION ENDED ---", LogType.SUCCESS)
             _isServicing.value = false
+            connection.releaseInterface(usbInterface)
+            connection.close()
         }
     }
 

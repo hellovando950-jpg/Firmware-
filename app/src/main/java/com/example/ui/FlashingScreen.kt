@@ -30,6 +30,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import android.net.Uri
+import android.provider.OpenableColumns
 import com.example.data.FlashingProfile
 import com.example.usb.UsbOtgHelper
 import com.example.usb.ConnectedDevice
@@ -79,19 +83,27 @@ fun FlashingScreen(
     // Dialog state for loading/saving custom profiles
     var showProfileSaveDialog by remember { mutableStateOf(false) }
     var newProfileNameInput by remember { mutableStateOf("") }
-    var showFilePickerForField by remember { mutableStateOf<String?>(null) } // Field key e.g. "MTK_AUTH"
 
-    // Dialog list options for our file pickers
-    val mockAuthFiles = listOf("MTK_Auth_v3.auth", "SecureBypass_v5.auth", "MTK_AllInOne_DA_v2.auth", "Custom_OEM.auth")
-    val mockScatterFiles = listOf("MT6765_Android_scatter.txt", "MT6739_Scatter_emmc.txt", "MT6877_Dimensity_scatter.txt", "MT6580_Scatter_legacy.txt")
-    val mockPreloaders = listOf("preloader_k61v1.bin", "preloader_redmi9a.bin", "preloader_vivo_y12s.bin")
-    
-    val mockFdls = listOf("fdl1_sc9863a.bin", "fdl1_unisoc_t610.bin", "fdl2_app_sc9863a.bin", "fdl2_unisoc_t610.bin", "generic_spd.bin")
-    val mockPacs = listOf("SPD_SC9863A_firmware.pac", "Unisoc_T610_stock.pac", "SPD_Tablet_OS_v2.pac")
-
-    val mockProgrammers = listOf("prog_firehose_8953.mbn", "prog_firehose_ddr_8998.elf", "prog_firehose_lite_sdm450.mbn", "prog_emmc_firehose_generic.mbn")
-    val mockRawprograms = listOf("rawprogram0.xml", "rawprogram_unsparse.xml", "rawprogram_upgrade.xml")
-    val mockPatches = listOf("patch0.xml", "patch_backup.xml")
+    var activeFieldForPick by remember { mutableStateOf<String?>(null) }
+    val fileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let {
+            val fileName = getFileNameFromUri(context, it) ?: it.toString()
+            when (activeFieldForPick) {
+                "MTK_AUTH" -> viewModel.updateMtkAuth(fileName)
+                "MTK_SCATTER" -> viewModel.updateMtkScatter(fileName)
+                "MTK_PRELOADER" -> viewModel.updateMtkPreloader(fileName)
+                "SPD_FDL1" -> viewModel.updateSpdFdl1(fileName)
+                "SPD_FDL2" -> viewModel.updateSpdFdl2(fileName)
+                "SPD_PAC" -> viewModel.updateSpdPac(fileName)
+                "QC_PROGRAMMER" -> viewModel.updateQcProgrammer(fileName)
+                "QC_RAWPROGRAM" -> viewModel.updateQcRawProgram(fileName)
+                "QC_PATCH" -> viewModel.updateQcPatch(fileName)
+            }
+            viewModel.addLog("Configured input resource: $fileName", LogType.INFO)
+        }
+    }
 
     val scrollState = rememberScrollState()
     val consoleListState = rememberLazyListState()
@@ -295,7 +307,7 @@ fun FlashingScreen(
                             )
                             if (connectedUsbDevices.isEmpty()) {
                                 Text(
-                                    text = "Ready to simulate serial bridge",
+                                    text = "Connect high-speed OTG cables to begin",
                                     style = MaterialTheme.typography.bodySmall.copy(
                                         color = SlateTextLight,
                                         fontSize = 11.sp
@@ -541,7 +553,7 @@ fun FlashingScreen(
                                 label = "Authentication File (.auth)",
                                 value = mtkAuthFile,
                                 onValueChange = { viewModel.updateMtkAuth(it) },
-                                onPickSimulated = { showFilePickerForField = "MTK_AUTH" },
+                                onPickFile = { activeFieldForPick = "MTK_AUTH"; fileLauncher.launch("*/*") },
                                 icon = Icons.Outlined.Key,
                                 isEnabled = !isFlashing
                             )
@@ -550,7 +562,7 @@ fun FlashingScreen(
                                 label = "Scatter Layout File (.txt)",
                                 value = mtkScatterFile,
                                 onValueChange = { viewModel.updateMtkScatter(it) },
-                                onPickSimulated = { showFilePickerForField = "MTK_SCATTER" },
+                                onPickFile = { activeFieldForPick = "MTK_SCATTER"; fileLauncher.launch("*/*") },
                                 icon = Icons.Outlined.GridOn,
                                 isEnabled = !isFlashing
                             )
@@ -559,7 +571,7 @@ fun FlashingScreen(
                                 label = "Preloader Core (.bin)",
                                 value = mtkPreloaderFile,
                                 onValueChange = { viewModel.updateMtkPreloader(it) },
-                                onPickSimulated = { showFilePickerForField = "MTK_PRELOADER" },
+                                onPickFile = { activeFieldForPick = "MTK_PRELOADER"; fileLauncher.launch("*/*") },
                                 icon = Icons.Outlined.Memory,
                                 isEnabled = !isFlashing
                             )
@@ -575,7 +587,7 @@ fun FlashingScreen(
                                         label = "FDL 1 Bootloader",
                                         value = spdFdl1File,
                                         onValueChange = { viewModel.updateSpdFdl1(it) },
-                                        onPickSimulated = { showFilePickerForField = "SPD_FDL1" },
+                                        onPickFile = { activeFieldForPick = "SPD_FDL1"; fileLauncher.launch("*/*") },
                                         icon = Icons.Outlined.Memory,
                                         isEnabled = !isFlashing
                                     )
@@ -585,7 +597,7 @@ fun FlashingScreen(
                                         label = "FDL 2 App loader",
                                         value = spdFdl2File,
                                         onValueChange = { viewModel.updateSpdFdl2(it) },
-                                        onPickSimulated = { showFilePickerForField = "SPD_FDL2" },
+                                        onPickFile = { activeFieldForPick = "SPD_FDL2"; fileLauncher.launch("*/*") },
                                         icon = Icons.Outlined.IntegrationInstructions,
                                         isEnabled = !isFlashing
                                     )
@@ -596,7 +608,7 @@ fun FlashingScreen(
                                 label = "Firmware PAC Package (*.pac)",
                                 value = spdPacFile,
                                 onValueChange = { viewModel.updateSpdPac(it) },
-                                onPickSimulated = { showFilePickerForField = "SPD_PAC" },
+                                onPickFile = { activeFieldForPick = "SPD_PAC"; fileLauncher.launch("*/*") },
                                 icon = Icons.Outlined.FolderZip,
                                 isEnabled = !isFlashing
                             )
@@ -607,7 +619,7 @@ fun FlashingScreen(
                                 label = "Firehose Programmer (.mbn/.elf)",
                                 value = qcProgrammerFile,
                                 onValueChange = { viewModel.updateQcProgrammer(it) },
-                                onPickSimulated = { showFilePickerForField = "QC_PROGRAMMER" },
+                                onPickFile = { activeFieldForPick = "QC_PROGRAMMER"; fileLauncher.launch("*/*") },
                                 icon = Icons.Outlined.Terminal,
                                 isEnabled = !isFlashing
                             )
@@ -621,7 +633,7 @@ fun FlashingScreen(
                                         label = "RawProgram Layout XML",
                                         value = qcRawProgramFile,
                                         onValueChange = { viewModel.updateQcRawProgram(it) },
-                                        onPickSimulated = { showFilePickerForField = "QC_RAWPROGRAM" },
+                                        onPickFile = { activeFieldForPick = "QC_RAWPROGRAM"; fileLauncher.launch("*/*") },
                                         icon = Icons.Outlined.Code,
                                         isEnabled = !isFlashing
                                     )
@@ -631,7 +643,7 @@ fun FlashingScreen(
                                         label = "Patch Points XML",
                                         value = qcPatchFile,
                                         onValueChange = { viewModel.updateQcPatch(it) },
-                                        onPickSimulated = { showFilePickerForField = "QC_PATCH" },
+                                        onPickFile = { activeFieldForPick = "QC_PATCH"; fileLauncher.launch("*/*") },
                                         icon = Icons.Outlined.Architecture,
                                         isEnabled = !isFlashing
                                     )
@@ -1469,7 +1481,7 @@ fun FlashingScreen(
                 }
             }
 
-            // SECTION 7: Simulated Progress writing bar
+            // SECTION 7: Real-time Transceiver Connection Progress
             Surface(
                 color = Color.White,
                 shape = RoundedCornerShape(12.dp),
@@ -1514,105 +1526,32 @@ fun FlashingScreen(
             }
         }
     }
+}
 
-    // Modal Simulation Pick File dialogs
-    showFilePickerForField?.let { fieldCode ->
-        val fileOptions = when (fieldCode) {
-            "MTK_AUTH" -> mockAuthFiles
-            "MTK_SCATTER" -> mockScatterFiles
-            "MTK_PRELOADER" -> mockPreloaders
-            "SPD_FDL1", "SPD_FDL2" -> mockFdls
-            "SPD_PAC" -> mockPacs
-            "QC_PROGRAMMER" -> mockProgrammers
-            "QC_RAWPROGRAM" -> mockRawprograms
-            else -> mockPatches
-        }
-
-        Dialog(onDismissRequest = { showFilePickerForField = null }) {
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = Color.White,
-                border = BorderStroke(1.dp, SlateBorder),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp)
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        text = "Simulate File Selection",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        color = SlateTextDark
-                    )
-                    Text(
-                        text = "Select from local storage assets matching directory structure:",
-                        fontSize = 11.sp,
-                        color = SlateTextLight
-                    )
-
-                    HorizontalDivider(color = SlateBorder)
-
-                    // Options list
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        fileOptions.forEach { option ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(Color(0xFFF8FAFC), RoundedCornerShape(8.dp))
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable {
-                                        when (fieldCode) {
-                                            "MTK_AUTH" -> viewModel.updateMtkAuth(option)
-                                            "MTK_SCATTER" -> viewModel.updateMtkScatter(option)
-                                            "MTK_PRELOADER" -> viewModel.updateMtkPreloader(option)
-                                            "SPD_FDL1" -> viewModel.updateSpdFdl1(option)
-                                            "SPD_FDL2" -> viewModel.updateSpdFdl2(option)
-                                            "SPD_PAC" -> viewModel.updateSpdPac(option)
-                                            "QC_PROGRAMMER" -> viewModel.updateQcProgrammer(option)
-                                            "QC_RAWPROGRAM" -> viewModel.updateQcRawProgram(option)
-                                            "QC_PATCH" -> viewModel.updateQcPatch(option)
-                                        }
-                                        viewModel.addLog("Configured input resource: path/sdcard0/$option", LogType.INFO)
-                                        showFilePickerForField = null
-                                    }
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.InsertDriveFile,
-                                    contentDescription = "file icon",
-                                    tint = Purple40,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = option,
-                                    fontSize = 12.sp,
-                                    color = SlateTextDark,
-                                    fontWeight = FontWeight.Medium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
-
-                    // Cancel
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        TextButton(onClick = { showFilePickerForField = null }) {
-                            Text("Cancel", color = SlateTextLight)
-                        }
-                    }
+// Query display name from system Uri
+fun getFileNameFromUri(context: android.content.Context, uri: Uri): String? {
+    var result: String? = null
+    if (uri.scheme == "content") {
+        val cursor = context.contentResolver.query(uri, null, null, null, null)
+        try {
+            if (cursor != null && cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index != -1) {
+                    result = cursor.getString(index)
                 }
             }
+        } finally {
+            cursor?.close()
         }
     }
+    if (result == null) {
+        result = uri.path
+        val cut = result?.lastIndexOf('/')
+        if (cut != null && cut != -1) {
+            result = result.substring(cut + 1)
+        }
+    }
+    return result
 }
 
 // Subcomponent: Custom Form File picker configuration layout
@@ -1622,7 +1561,7 @@ fun ConfigFileSelectorField(
     label: String,
     value: String,
     onValueChange: (String) -> Unit,
-    onPickSimulated: () -> Unit,
+    onPickFile: () -> Unit,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     isEnabled: Boolean = true
 ) {
@@ -1673,7 +1612,7 @@ fun ConfigFileSelectorField(
             )
             Spacer(modifier = Modifier.width(8.dp))
             IconButton(
-                onClick = { onPickSimulated() },
+                onClick = { onPickFile() },
                 enabled = isEnabled,
                 modifier = Modifier
                     .size(24.dp)
