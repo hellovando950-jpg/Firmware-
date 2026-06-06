@@ -1,0 +1,6 @@
+{
+  "name": "FlashTool Pro",
+  "description": "Android software flashing utility for MediaTek (MTK), Qualcomm, and Spreadtrum devices featuring USB OTG handshakes, file configurations, and real-time logs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
